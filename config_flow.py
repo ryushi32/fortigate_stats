@@ -1,8 +1,3 @@
-from .snmp import (
-    async_snmp_getfromtable,
-    async_snmp_getmulti,
-    async_snmp_getmultifromtable,
-)
 import traceback
 import logging
 import voluptuous as vol
@@ -32,9 +27,9 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
                 vol.Required(CONF_USERNAME): str,
                 vol.Required(CONF_IP_ADDRESS): str,
                 vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
-                vol.Required(CONF_CPUANDRAM, default=True): bool,
-                vol.Required(CONF_DISK, default=True): bool,
-                vol.Required(CONF_SESSIONS, default=True): bool,
+                vol.Optional(CONF_CPUANDRAM, default=True): bool,
+                vol.Optional(CONF_DISK, default=True): bool,
+                vol.Optional(CONF_SESSIONS, default=True): bool,
                 vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
                 vol.Optional(CONF_INTERFACESYESNO, default=True): bool,
                 vol.Optional(CONF_PERFORMANCESLASYESNO, default=False): bool,
@@ -57,10 +52,12 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
         port = user_input[CONF_PORT]
                         
         try:
+            from .snmp import async_snmp_getmulti
+
             #We only need to get this information once, so get it as part of the connection test and add it to user_input
             oids = (OID_HOSTNAME, OID_SERIALNUMBER, OID_MODEL,OID_FORTIOS)
             errorIndication, oidReturn = await async_snmp_getmulti(
-                ipaddress, username, port, oids
+                self.hass, ipaddress, username, port, oids
             )
             
             if errorIndication:
@@ -108,26 +105,37 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
             username = self.user_input[CONF_USERNAME]
             ipaddress = self.user_input[CONF_IP_ADDRESS]
             port = self.user_input[CONF_PORT]
-            
-            oids = (OID_IFSTATUS, OID_IFNAME, OID_IFALIAS)
 
             CONNECTED_INTERFACES = {}
-            errorIndication, snmp_data = await async_snmp_getmultifromtable(
-                ipaddress, username, port, oids
-            )
-            if not errorIndication:
+            try:
+                from .snmp import async_snmp_getmultifromtable
+
+                oids = (OID_IFSTATUS, OID_IFNAME, OID_IFALIAS)
+                errorIndication, snmp_data = await async_snmp_getmultifromtable(
+                    self.hass, ipaddress, username, port, oids
+                )
+                if errorIndication:
+                    LOGGER.error("Unable to read interfaces: %s", errorIndication)
+                    return self._show_form(
+                        step_id="user",
+                        data_schema=self._user_schema(),
+                        errors={"base": "connection_error"},
+                    )
                 for status, name, alias in snmp_data:
-                    if int(status[1]) == 1:
-                        #Include it in the list
-                        #Get the right name
-                        if ( alias[1].prettyPrint() != ""):
+                    if _snmp_value_int(status[1]) == 1:
+                        if alias[1].prettyPrint() != "":
                             final_name = alias[1].prettyPrint()
                         else:
                             final_name = name[1].prettyPrint()
-
-                        #Add it
                         CONNECTED_INTERFACES[name[0].prettyPrint()] = final_name
-                            
+            except Exception:
+                LOGGER.error("Unable to read interfaces: %s", traceback.format_exc())
+                return self._show_form(
+                    step_id="user",
+                    data_schema=self._user_schema(),
+                    errors={"base": "connection_error"},
+                )
+
             return self._show_form(
                 step_id = "interfaces",
                 data_schema = vol.Schema(
@@ -165,15 +173,31 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
             ipaddress = self.user_input[CONF_IP_ADDRESS]
             port = self.user_input[CONF_PORT]
 
+            from .snmp import async_snmp_getfromtable
+
             PERFORMANCESLA_LINKS = {}
-            errorIndication, snmp_data = await async_snmp_getfromtable(
-                ipaddress, username, port, OID_PERFORMANCESLALINKNAME
-            )
-            if not errorIndication:
+            try:
+                errorIndication, snmp_data = await async_snmp_getfromtable(
+                    self.hass, ipaddress, username, port, OID_PERFORMANCESLALINKNAME
+                )
+                if errorIndication:
+                    LOGGER.error("Unable to read performance SLAs: %s", errorIndication)
+                    return self._show_form(
+                        step_id="user",
+                        data_schema=self._user_schema(),
+                        errors={"base": "connection_error"},
+                    )
                 for oid_entry in snmp_data:
                     for oid, oid_value in oid_entry:
                         PERFORMANCESLA_LINKS[oid.prettyPrint()] = oid_value.prettyPrint()
-                            
+            except Exception:
+                LOGGER.error("Unable to read performance SLAs: %s", traceback.format_exc())
+                return self._show_form(
+                    step_id="user",
+                    data_schema=self._user_schema(),
+                    errors={"base": "connection_error"},
+                )
+
             return self._show_form(
                 step_id = "performanceslas",
                 data_schema = vol.Schema(
@@ -215,16 +239,10 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        return OptionsFlowHandler(config_entry)
+        return OptionsFlowHandler()
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    def __init__(self, config_entry):
-        """Initialize options flow."""
-        self.config_entry = config_entry
-        self.options = dict(config_entry.options)
-
-
     async def async_step_init(self, user_input=None):
         """Manage the options."""
         if user_input is not None:
@@ -239,6 +257,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             )
 
         )
-    async def _update_options(self):
-        """Update config entry options."""
-        return self.async_create_entry(title="", data=self.options)
+
+
+def _snmp_value_int(value) -> int:
+    """Convert an SNMP value to int."""
+    if hasattr(value, "prettyPrint"):
+        return int(value.prettyPrint())
+    return int(value)

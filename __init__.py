@@ -1,50 +1,54 @@
 """fortigate_Stats integration."""
-from .const import *
-import voluptuous as vol
+
 import asyncio
 
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.entity import Entity
-from homeassistant.const import (
-    CONF_PASSWORD,
-    CONF_USERNAME,
-    CONF_IP_ADDRESS,
-    CONF_SCAN_INTERVAL,
-    CONF_PORT
-)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
 
-async def async_setup(hass, config):
+from homeassistant.const import CONF_SCAN_INTERVAL
+
+from .const import DOMAIN, PLATFORMS
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Set up the integration from configuration.yaml."""
     hass.data.setdefault(DOMAIN, {})
-    """Set up a skeleton component."""
     return True
 
-async def async_setup_entry(hass, config_entry):
 
-    hass.async_add_job(hass.config_entries.async_forward_entry_setup(config_entry, "sensor"))
-    config_entry.add_update_listener(update_listener)
+async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Set up fortigate_stats from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
 
-    return True
-    
-    def _stop_monitor(_event):
-        monitor.stopped=True
-        #hass.states.async_set
-        hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, _stop_monitor)
-        LOGGER.error('Init done')
-        return True
-
-### TESTING ###
-async def async_unload_entry(hass, config_entry):
-    """Handle removal of an entry."""
-    await asyncio.gather(
-        *[
-            hass.config_entries.async_forward_entry_unload(config_entry, platform)
-            for platform in PLATFORMS
-        ]
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    config_entry.async_on_unload(
+        config_entry.add_update_listener(update_listener)
     )
-    LOGGER.error("Successfully removed the FortiGate Stats integration")
 
     return True
-### TESTING ###
 
-async def update_listener(hass, entry):
-    hass.data[DOMAIN][entry.entry_id]["monitor"].updateIntervalSeconds=entry.options.get(CONF_SCAN_INTERVAL)
+
+async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = all(
+        await asyncio.gather(
+            *[
+                hass.config_entries.async_forward_entry_unload(
+                    config_entry, platform
+                )
+                for platform in PLATFORMS
+            ]
+        )
+    )
+
+    if unload_ok:
+        hass.data[DOMAIN].pop(config_entry.entry_id, None)
+
+    return unload_ok
+
+
+async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Handle options update."""
+    monitor = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("monitor")
+    if monitor is not None:
+        monitor.update_interval_seconds = entry.options.get(CONF_SCAN_INTERVAL)

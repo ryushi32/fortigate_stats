@@ -6,6 +6,8 @@ import asyncio
 import logging
 from typing import Any
 
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant, callback
 from pysnmp.error import PySnmpError
 from pysnmp.hlapi.v3arch.asyncio import (
     CommunityData,
@@ -18,25 +20,54 @@ from pysnmp.hlapi.v3arch.asyncio import (
     get_cmd,
     next_cmd,
 )
+from pysnmp.hlapi.v3arch.asyncio.cmdgen import LCD
+from pysnmp.smi import view
+
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10
 SNMP_V2C = 1
 
 _snmp_engine: SnmpEngine | None = None
-_hass_loop: asyncio.AbstractEventLoop | None = None
+_engine_lock = asyncio.Lock()
 
 
-def configure_snmp_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """Register the Home Assistant event loop for sync callers in worker threads."""
-    global _hass_loop
-    _hass_loop = loop
+def _build_snmp_engine() -> SnmpEngine:
+    """Create SnmpEngine and preload MIBs (blocking — run in executor)."""
+    engine = SnmpEngine()
+    mib_view_controller = view.MibViewController(
+        engine.message_dispatcher.mib_instrum_controller.get_mib_builder()
+    )
+    engine.cache["mibViewController"] = mib_view_controller
+    mib_view_controller.mibBuilder.load_modules()
+    return engine
 
 
-def _get_engine() -> SnmpEngine:
+async def async_setup_snmp(hass: HomeAssistant) -> SnmpEngine:
+    """Initialize the shared SNMP engine off the event loop."""
     global _snmp_engine
+
+    if _snmp_engine is not None:
+        return _snmp_engine
+
+    async with _engine_lock:
+        if _snmp_engine is None:
+            engine = await hass.async_add_executor_job(_build_snmp_engine)
+            _snmp_engine = engine
+
+            @callback
+            def _async_shutdown(_event) -> None:
+                LOGGER.debug("Unconfiguring SNMP engine")
+                LCD.unconfigure(engine, None)
+
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_shutdown)
+
+    return _snmp_engine
+
+
+async def _get_engine(hass: HomeAssistant) -> SnmpEngine:
     if _snmp_engine is None:
-        _snmp_engine = SnmpEngine()
+        return await async_setup_snmp(hass)
     return _snmp_engine
 
 
@@ -60,6 +91,16 @@ def _row_from_binds(var_binds: tuple[ObjectType, ...]) -> tuple[Any, ...]:
     return tuple((bind[0], bind[1]) for bind in var_binds)
 
 
+def _oid_str(oid_obj: Any) -> str:
+    """Return OID string from an SNMP object identity."""
+    if hasattr(oid_obj, "prettyPrint"):
+        try:
+            return oid_obj.prettyPrint()
+        except Exception:
+            pass
+    return str(oid_obj)
+
+
 def _table_prefix(oid: str) -> str:
     return oid if oid.endswith(".") else f"{oid}."
 
@@ -67,16 +108,18 @@ def _table_prefix(oid: str) -> str:
 def _is_end_of_table(prefix: str, var_binds: tuple[ObjectType, ...]) -> bool:
     if not var_binds:
         return True
-    oid = var_binds[0][0]
-    oid_str = oid.prettyPrint() if hasattr(oid, "prettyPrint") else str(oid)
-    return not str(oid_str).startswith(prefix)
+    return not _oid_str(var_binds[0][0]).startswith(prefix)
 
 
 async def async_snmp_getmulti(
-    host: str, community: str, port: int, oids: tuple[str, ...]
+    hass: HomeAssistant,
+    host: str,
+    community: str,
+    port: int,
+    oids: tuple[str, ...],
 ) -> tuple[Any | None, tuple[Any, ...] | None]:
     """SNMP GET for one or more scalar OIDs."""
-    engine = _get_engine()
+    engine = await _get_engine(hass)
     target = await _create_target(host, port)
     auth = _community(community)
     context = ContextData()
@@ -99,10 +142,14 @@ async def async_snmp_getmulti(
 
 
 async def async_snmp_getfromtable(
-    host: str, community: str, port: int, oid: str
+    hass: HomeAssistant,
+    host: str,
+    community: str,
+    port: int,
+    oid: str,
 ) -> tuple[Any | None, list[tuple[Any, ...]]]:
     """Walk a single table column; returns rows as (oid, value) pairs."""
-    engine = _get_engine()
+    engine = await _get_engine(hass)
     target = await _create_target(host, port)
     auth = _community(community)
     context = ContextData()
@@ -130,16 +177,20 @@ async def async_snmp_getfromtable(
             break
 
         rows.append(_row_from_binds(var_binds))
-        var_bind = ObjectType(ObjectIdentity(var_binds[0][0].prettyPrint()))
+        var_bind = ObjectType(ObjectIdentity(_oid_str(var_binds[0][0])))
 
     return None, rows
 
 
 async def async_snmp_getmultifromtable(
-    host: str, community: str, port: int, oids: tuple[str, ...]
+    hass: HomeAssistant,
+    host: str,
+    community: str,
+    port: int,
+    oids: tuple[str, ...],
 ) -> tuple[Any | None, list[tuple[Any, ...]]]:
     """Walk a table using multiple column OIDs; each row is one tuple per column."""
-    engine = _get_engine()
+    engine = await _get_engine(hass)
     target = await _create_target(host, port)
     auth = _community(community)
     context = ContextData()
@@ -168,36 +219,7 @@ async def async_snmp_getmultifromtable(
 
         rows.append(_row_from_binds(response_binds))
         var_binds = tuple(
-            ObjectType(ObjectIdentity(bind[0].prettyPrint())) for bind in response_binds
+            ObjectType(ObjectIdentity(_oid_str(bind[0]))) for bind in response_binds
         )
 
     return None, rows
-
-
-def _run_sync(coro) -> Any:
-    loop = _hass_loop
-    if loop is not None and loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result(timeout=DEFAULT_TIMEOUT + 10)
-    return asyncio.run(coro)
-
-
-def snmp_getmulti(
-    host: str, community: str, port: int, oids: tuple[str, ...]
-) -> tuple[Any | None, tuple[Any, ...] | None]:
-    """Sync wrapper for worker threads (requires configure_snmp_loop)."""
-    return _run_sync(async_snmp_getmulti(host, community, port, oids))
-
-
-def snmp_getfromtable(
-    host: str, community: str, port: int, oid: str
-) -> tuple[Any | None, list[tuple[Any, ...]]]:
-    """Sync wrapper for worker threads (requires configure_snmp_loop)."""
-    return _run_sync(async_snmp_getfromtable(host, community, port, oid))
-
-
-def snmp_getmultifromtable(
-    host: str, community: str, port: int, oids: tuple[str, ...]
-) -> tuple[Any | None, list[tuple[Any, ...]]]:
-    """Sync wrapper for worker threads (requires configure_snmp_loop)."""
-    return _run_sync(async_snmp_getmultifromtable(host, community, port, oids))

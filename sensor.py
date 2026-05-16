@@ -1,395 +1,446 @@
+"""Sensor platform for FortiGate Stats."""
+
+from __future__ import annotations
+
+import logging
 import time
-import traceback
-#import sys
+from datetime import timedelta
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.event import async_track_time_interval
 
 # pylint: disable=unused-wildcard-import
-from .const import * 
-from pysnmp.error import PySnmpError
-
-from .snmp import configure_snmp_loop, snmp_getfromtable, snmp_getmulti, snmp_getmultifromtable
-
-# pylint: enable=unused-wildcard-import
-import threading
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.entity import Entity
-
-from homeassistant.const import (
-    CONF_PASSWORD,
-    CONF_USERNAME,
-    CONF_IP_ADDRESS,
-    EVENT_HOMEASSISTANT_STOP, 
-    CONF_SCAN_INTERVAL,
-    CONF_PORT
+from .const import *  # noqa: F403
+from .snmp import (
+    async_setup_snmp,
+    async_snmp_getfromtable,
+    async_snmp_getmulti,
+    async_snmp_getmultifromtable,
 )
 
+# pylint: enable=unused-wildcard-import
 
-async def async_setup_platform(
-    hass, config, async_add_entities, discovery_info=None
-):  # pylint: disable=unused-argument
-    """Set up sensor platform."""
-    maxretries=3
-    
-    for i in range(maxretries):
-        try:
-            monitor = SnmpStatisticsMonitor(config_entry,async_add_entities)
-            break
-        except:
-            if i==maxretries-1:
-                raise
-       
-    hass.data[DOMAIN][config_entry.entry_id]={"monitor":monitor}
-    
-    monitor.start()
+from homeassistant.const import (  # noqa: E402
+    CONF_IP_ADDRESS,
+    CONF_PORT,
+    CONF_SCAN_INTERVAL,
+    CONF_USERNAME,
+)
 
-    def _stop_monitor(_event):
-        monitor.stopped=True
-        #hass.states.async_set
-        hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, _stop_monitor)
-        LOGGER.error('_Stop_monitor')
-        return True
+_LOGGER = logging.getLogger(__name__)
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
-    """Set up sensor platform."""
-    configure_snmp_loop(hass.loop)
-    maxretries=2
-    for i in range(maxretries):
-        try:
-            monitor = SnmpStatisticsMonitor(config_entry,async_add_entities)
-            break
-        except:
-            if i==maxretries-1:
-                raise
-       
-    hass.data[DOMAIN][config_entry.entry_id]={"monitor":monitor}
-    
-    monitor.start()
+
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities
+) -> None:
+    """Set up FortiGate Stats sensors from a config entry."""
+    await async_setup_snmp(hass)
+
+    monitor = SnmpStatisticsMonitor(hass, config_entry, async_add_entities)
+    hass.data.setdefault(DOMAIN, {})[config_entry.entry_id] = {"monitor": monitor}
+
+    await monitor.async_update()
+
+    interval = timedelta(
+        seconds=monitor.update_interval_seconds or DEFAULT_SCAN_INTERVAL
+    )
+
+    @callback
+    def _async_poll(now) -> None:
+        hass.async_create_task(monitor.async_update())
+
+    config_entry.async_on_unload(
+        async_track_time_interval(hass, _async_poll, interval)
+    )
 
 
 class SnmpStatisticsSensor(Entity):
-    def __init__(self,id,fw_info,name=None,unit=None,icon=None):
+    """FortiGate SNMP sensor."""
+
+    def __init__(self, entity_id, fw_info, name=None, unit=None, icon=None):
         self._attributes = {}
-        self._state ="NOTRUN"
+        self._state = "unknown"
         self.fw_info = fw_info
-        self.entity_id=id
-        if name is None:
-            name=id
-        self._name=name
-        if unit is not None:
-            self._unitofmeasurement=unit
-        if icon is None:
-            icon = "mdi:eye"
-        self._icon = icon
-            
-        LOGGER.info("Created sensor {0}".format(id))
+        self.entity_id = entity_id
+        self._name = name if name is not None else entity_id
+        self._unitofmeasurement = unit
+        self._icon = icon if icon is not None else "mdi:eye"
+        _LOGGER.info("Created sensor %s", entity_id)
 
     def set_state(self, state):
         """Set the state."""
-        if self._state==state:
+        if self._state == state:
             return
         self._state = state
-        if self.enabled:
-            self.schedule_update_ha_state()
+        self.async_write_ha_state()
 
     def set_attributes(self, attributes):
         """Set the state attributes."""
         self._attributes = attributes
+        self.async_write_ha_state()
 
     @property
     def icon(self):
-        """Return the icon to be used for this entity."""
         return self._icon
 
     @property
     def unique_id(self) -> str:
-        """Return the unique ID for this sensor."""
         return self.entity_id
 
     @property
     def should_poll(self):
-        """Only poll to update phonebook, if defined."""
         return False
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes."""
-        return self._attributes
+
     @property
     def extra_state_attributes(self):
-        """Return the state attributes."""
         return self._attributes
+
     @property
     def unit_of_measurement(self):
-        """Return the unit the value is expressed in."""
         return self._unitofmeasurement
+
     @property
     def state(self):
-        """Return the state of the device."""
         return self._state
+
     @property
     def name(self):
-        """Return the name of the sensor."""
         return self._name
-    def update(self):
-        LOGGER.info("Updated "+self.entity_id)
 
     @property
     def device_info(self):
-        """Return device info for this sensor."""
         identifier = {(DOMAIN, self.fw_info[OID_SERIALNUMBER])}
         return {
             "identifiers": identifier,
             "name": self.fw_info[OID_HOSTNAME],
             "manufacturer": "Fortinet",
             "model": self.fw_info[OID_MODEL],
-            "sw_version": self.fw_info[OID_FORTIOS]
+            "sw_version": self.fw_info[OID_FORTIOS],
         }
 
-class SnmpStatisticsMonitor:
 
-    def __init__(self,config_entry,async_add_entities=None):
-        self.meterSensors={}
-        self.stopped = False
-        self.async_add_entities=async_add_entities
-        self.current_if_data={} 
-        self.current_if_data_time=0
-        self.stat_time=0
-        self.username=config_entry.data.get(CONF_USERNAME)
-        self.target_ip=config_entry.data.get(CONF_IP_ADDRESS)
-        self.port=config_entry.data.get(CONF_PORT)
-        self.updateIntervalSeconds=config_entry.data.get(CONF_SCAN_INTERVAL)
-        self.include_cpu_and_ram=config_entry.data.get(CONF_CPUANDRAM)
-        self.include_disk=config_entry.data.get(CONF_DISK)
-        self.include_sessions=config_entry.data.get(CONF_SESSIONS)
+class SnmpStatisticsMonitor:
+    """Poll FortiGate SNMP metrics and manage sensor entities."""
+
+    def __init__(self, hass, config_entry, async_add_entities):
+        self.hass = hass
+        self.config_entry = config_entry
+        self.async_add_entities = async_add_entities
+        self.meter_sensors = {}
+        self.current_if_data = {}
+        self.current_if_data_time = 0
+
+        self.username = config_entry.data.get(CONF_USERNAME)
+        self.target_ip = config_entry.data.get(CONF_IP_ADDRESS)
+        self.port = config_entry.data.get(CONF_PORT, DEFAULT_PORT)
+        self.update_interval_seconds = config_entry.data.get(CONF_SCAN_INTERVAL)
+
+        self.include_cpu_and_ram = config_entry.data.get(CONF_CPUANDRAM)
+        self.include_disk = config_entry.data.get(CONF_DISK)
+        self.include_sessions = config_entry.data.get(CONF_SESSIONS)
 
         self.include_interfaces = config_entry.data.get(CONF_INTERFACESYESNO)
+        self.interfaces = set()
         if self.include_interfaces:
-            self.interfaces = config_entry.data.get(CONF_INTERFACES)
+            selected = config_entry.data.get(CONF_INTERFACES) or []
+            if isinstance(selected, dict):
+                selected = list(selected)
+            self.interfaces = set(selected)
             self.interfacesbandwidth = config_entry.data.get(CONF_INTERFACESBANDWIDTH)
             self.interfacesoctets = config_entry.data.get(CONF_INTERFACESOCTETS)
 
         self.include_performanceslas = config_entry.data.get(CONF_PERFORMANCESLASYESNO)
+        self.performance_slas = set()
         if self.include_performanceslas:
-            self.performance_slas = config_entry.data.get(CONF_PERFORMANCESLAS)
-            self.include_performanceslasstate = config_entry.data.get(CONF_PERFORMANCESLASSTATE)
-            self.include_performanceslaslinkmetrics = config_entry.data.get(CONF_PERFORMANCESLASLINKMETRICS)
-            self.include_performanceslasbandwidthprobe = config_entry.data.get(CONF_PERFORMANCESLASBANDWIDTHPROBE)
-          
+            selected = config_entry.data.get(CONF_PERFORMANCESLAS) or []
+            if isinstance(selected, dict):
+                selected = list(selected)
+            self.performance_slas = set(selected)
+            self.include_performanceslasstate = config_entry.data.get(
+                CONF_PERFORMANCESLASSTATE
+            )
+            self.include_performanceslaslinkmetrics = config_entry.data.get(
+                CONF_PERFORMANCESLASLINKMETRICS
+            )
+            self.include_performanceslasbandwidthprobe = config_entry.data.get(
+                CONF_PERFORMANCESLASBANDWIDTHPROBE
+            )
+
         self.fw_info = {
             OID_HOSTNAME: config_entry.data.get(OID_HOSTNAME),
             OID_SERIALNUMBER: config_entry.data.get(OID_SERIALNUMBER),
             OID_MODEL: config_entry.data.get(OID_MODEL),
-            OID_FORTIOS: config_entry.data.get(OID_FORTIOS)
-            }
-        self.update_stats()#try this to throw error if not working.
-        if async_add_entities is not None:
-            self.setupEntities()
+            OID_FORTIOS: config_entry.data.get(OID_FORTIOS),
+        }
 
-    def update_stats(self):
-        self.update_netif_stats()
-        
-    def update_netif_stats(self):
-        if_data=self.current_if_data
- 
-        oids = (OID_IFNAME, OID_IFALIAS, OID_IFHCINOCTETS, OID_IFHCOUTOCTETS) 
-        errorIndication, snmp_data = snmp_getmultifromtable(self.target_ip, self.username, self.port, oids)
-        if not errorIndication:
+    async def async_update(self) -> None:
+        """Refresh SNMP data and update sensor entities."""
+        try:
+            if self.include_interfaces and self.interfaces:
+                await self._async_update_netif_stats()
+            await self._async_add_or_update_entities()
+        except Exception:
+            _LOGGER.exception("Error updating FortiGate Stats sensors")
 
-            for interface in if_data:
-                if_data[interface]['rx_octets_prev'] = if_data[interface]['rx_octets']
-                if_data[interface]['tx_octets_prev'] = if_data[interface]['tx_octets']
+    async def _async_update_netif_stats(self) -> None:
+        if_data = self.current_if_data
+        oids = (OID_IFNAME, OID_IFALIAS, OID_IFHCINOCTETS, OID_IFHCOUTOCTETS)
+        error_indication, snmp_data = await async_snmp_getmultifromtable(
+            self.hass, self.target_ip, self.username, self.port, oids
+        )
+        if error_indication:
+            _LOGGER.warning("Interface SNMP error: %s", error_indication)
+            return
 
-            for if_name, if_alias, if_hcinoctets, if_hcoutoctets in snmp_data:
-                if if_name[0].prettyPrint() in self.interfaces:
-                    #The interface is in scope.
-                        
-                    ifId = if_name[0].prettyPrint()
-                    if ifId not in if_data:
-                        if_data[ifId]={
-                            'name':'',
-                            'alias':'',
-                            'rx_octets':-1,
-                            'tx_octets':-1,
-                            'rx_speed_octets':-1.0,
-                            'tx_speed_octets':-1.0,
-                            'rx_octets_prev':-1.0,
-                            'tx_octets_prev':-1.0,
-                            'last_stat_time':time.time(),
-                            'rx_diff':-1,
-                            'tx_diff':-1
-                            }
-                
-                    if_data[ifId]['name'] = if_name[1].prettyPrint()
-                    if_data[ifId]['alias'] = if_alias[1].prettyPrint()
-                    if_data[ifId]['rx_octets'] = int(if_hcinoctets[1].prettyPrint())
-                    if_data[ifId]['tx_octets'] = int(if_hcoutoctets[1].prettyPrint())
+        for interface in if_data:
+            if_data[interface]["rx_octets_prev"] = if_data[interface]["rx_octets"]
+            if_data[interface]["tx_octets_prev"] = if_data[interface]["tx_octets"]
 
-            new_if_data_time=time.time()
-            for k in self.current_if_data:
-                cur_data=self.current_if_data[k]
-                
-                timediff_statistics=new_if_data_time-cur_data['last_stat_time']
-                timediff_stat_seconds=timediff_statistics#/1000.0
+        for if_name, if_alias, if_hcinoctets, if_hcoutoctets in snmp_data:
+            if_id = if_name[0].prettyPrint()
+            if if_id not in self.interfaces:
+                continue
 
-                rx_diff=cur_data['rx_octets'] - cur_data['rx_octets_prev']
-                tx_diff=cur_data['tx_octets'] - cur_data['tx_octets_prev']
+            if if_id not in if_data:
+                if_data[if_id] = {
+                    "name": "",
+                    "alias": "",
+                    "rx_octets": -1,
+                    "tx_octets": -1,
+                    "rx_speed_octets": -1.0,
+                    "tx_speed_octets": -1.0,
+                    "rx_octets_prev": -1.0,
+                    "tx_octets_prev": -1.0,
+                    "last_stat_time": time.time(),
+                    "rx_diff": -1,
+                    "tx_diff": -1,
+                }
 
-                cur_data['rx_diff']=rx_diff
-                cur_data['tx_diff']=tx_diff
+            if_data[if_id]["name"] = if_name[1].prettyPrint()
+            if_data[if_id]["alias"] = if_alias[1].prettyPrint()
+            if_data[if_id]["rx_octets"] = int(if_hcinoctets[1].prettyPrint())
+            if_data[if_id]["tx_octets"] = int(if_hcoutoctets[1].prettyPrint())
 
-                if timediff_stat_seconds<1:
-                    continue
+        new_if_data_time = time.time()
+        for if_id in list(self.current_if_data):
+            cur_data = self.current_if_data[if_id]
+            timediff_stat_seconds = new_if_data_time - cur_data["last_stat_time"]
 
-                if rx_diff==0 and tx_diff==0 and timediff_stat_seconds<4:##wait until really going to 0
-                    continue
+            rx_diff = cur_data["rx_octets"] - cur_data["rx_octets_prev"]
+            tx_diff = cur_data["tx_octets"] - cur_data["tx_octets_prev"]
 
-                rx_byte_s = rx_diff / timediff_stat_seconds
-                tx_byte_s = tx_diff / timediff_stat_seconds
-                cur_data['last_stat_time']=new_if_data_time
+            cur_data["rx_diff"] = rx_diff
+            cur_data["tx_diff"] = tx_diff
 
-                cur_data['rx_speed_octets']=rx_byte_s
-                cur_data['tx_speed_octets']=tx_byte_s
+            if timediff_stat_seconds < 1:
+                continue
 
+            if rx_diff == 0 and tx_diff == 0 and timediff_stat_seconds < 4:
+                continue
 
-            self.current_if_data=if_data
-            self.current_if_data_time=new_if_data_time
+            cur_data["rx_speed_octets"] = rx_diff / timediff_stat_seconds
+            cur_data["tx_speed_octets"] = tx_diff / timediff_stat_seconds
+            cur_data["last_stat_time"] = new_if_data_time
 
-    def start(self):
-        threading.Thread(target=self.watcher).start()
-    def watcher(self):
-        LOGGER.info(f'Start Watcher Thread - updateInterval:{self.updateIntervalSeconds}')
+        self.current_if_data = if_data
+        self.current_if_data_time = new_if_data_time
 
-        while not self.stopped:
-            try:
-                self.update_stats()
-                if self.async_add_entities is not None:
-                    self.AddOrUpdateEntities()
-            except (KeyError,PySnmpError):
-                time.sleep(1)
-            except:
-                e = traceback.format_exc()
-            if self.updateIntervalSeconds is None:
-                self.updateIntervalSeconds=DEFAULT_SCAN_INTERVAL
-
-            time.sleep(self.updateIntervalSeconds)
-
-    #region HA
-    def setupEntities(self):
-        self.update_stats()
-        
-        if self.async_add_entities is not None:
-            self.AddOrUpdateEntities()
-
-    
-    def _AddOrUpdateEntity(self,id,friendlyname,value,unit,icon,attributes = None):
-        if id in self.meterSensors:
-            sensor=self.meterSensors[id]
+    def _add_or_update_entity(
+        self, entity_id, friendlyname, value, unit, icon, attributes=None
+    ):
+        if entity_id in self.meter_sensors:
+            sensor = self.meter_sensors[entity_id]
             sensor.set_state(value)
         else:
-            sensor=SnmpStatisticsSensor(id,self.fw_info,friendlyname,unit,icon)
-            sensor._state=value
+            sensor = SnmpStatisticsSensor(
+                entity_id, self.fw_info, friendlyname, unit, icon
+            )
+            sensor._state = value
             self.async_add_entities([sensor])
-            self.meterSensors[id]=sensor
-            
+            self.meter_sensors[entity_id] = sensor
+
         if attributes is not None:
-            sensor.set_attributes (attributes)
-        
-    def AddOrUpdateEntities(self):
-        allSensorsPrefix = "sensor." + DOMAIN + "_" + self.fw_info[OID_SERIALNUMBER].replace('.','_') + "_"
-        
-        for k in self.current_if_data:
-            cur_if_data=self.current_if_data[k]
-            if_name=cur_if_data['name']
-            if_alias=cur_if_data['alias']
-            
-            if if_alias != "":
-                if_display = if_alias
-            else:
-                if_display = if_name
- 
-            if_rx_mbit=cur_if_data['rx_speed_octets']*8/1000/1000
-            if_tx_mbit=cur_if_data['tx_speed_octets']*8/1000/1000
-            #if_rx_mbyte=cur_if_data['rx_speed_octets']/1000/1000
-            #if_tx_mbyte=cur_if_data['tx_speed_octets']/1000/1000
+            self.meter_sensors[entity_id].set_attributes(attributes)
 
-            # if_rx_total_mbit=cur_if_data['rx_octets']*8/1000/1000
-            # if_tx_total_mbit=cur_if_data['tx_octets']*8/1000/1000
+    async def _async_add_or_update_entities(self) -> None:
+        serial = self.fw_info[OID_SERIALNUMBER].replace(".", "_")
+        prefix = f"sensor.{DOMAIN}_{serial}_"
 
-            if self.interfacesbandwidth:
-                self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_curbw_out_mbit',if_display+" bandwidth out",round(if_tx_mbit,2),'Mbps',"mdi:upload-network-outline")
-                self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_curbw_in_mbit',if_display+" bandwidth in",round(if_rx_mbit,2),'Mbps',"mdi:download-network-outline")
+        for if_id in self.current_if_data:
+            cur_if_data = self.current_if_data[if_id]
+            if_name = cur_if_data["name"]
+            if_alias = cur_if_data["alias"]
+            if_display = if_alias if if_alias else if_name
 
-            if self.interfacesoctets:
-                self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_octets_out',if_display+" octets out",int(cur_if_data['tx_octets']),'octets',"mdi:upload-network-outline")
-                self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_octets_in',if_display+" octets in",int(cur_if_data['rx_octets']),'octets',"mdi:download-network-outline")
+            if_rx_mbit = cur_if_data["rx_speed_octets"] * 8 / 1000 / 1000
+            if_tx_mbit = cur_if_data["tx_speed_octets"] * 8 / 1000 / 1000
 
-            #self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_curbw_out_mbyte',if_name+" BW Out (mbyte)",round(if_tx_mbyte,2),'mbyte/s')
-            #self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_curbw_in_mbyte',if_name+" BW In (mbyte)",round(if_rx_mbyte,2),'mbyte/s')
+            if self.include_interfaces and self.interfacesbandwidth:
+                self._add_or_update_entity(
+                    prefix + f"netif_{if_name}_curbw_out_mbit",
+                    f"{if_display} bandwidth out",
+                    round(if_tx_mbit, 2),
+                    "Mbps",
+                    "mdi:upload-network-outline",
+                )
+                self._add_or_update_entity(
+                    prefix + f"netif_{if_name}_curbw_in_mbit",
+                    f"{if_display} bandwidth in",
+                    round(if_rx_mbit, 2),
+                    "Mbps",
+                    "mdi:download-network-outline",
+                )
 
-            # self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_total_out_mbit',if_name+" Total Out (mbit)",round(if_tx_total_mbit,2),'mbit')
-            # self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_total_in_mbit',if_name+" Total In (mbit)",round(if_rx_total_mbit,2),'mbit')
-            
-            # self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_total_out_byte',if_name+" Total Out (bytes)",cur_if_data['tx_octets'],'byte')
-            # self._AddOrUpdateEntity(allSensorsPrefix+"netif_"+if_name+'_total_in_byte',if_name+" Total In (bytes)",cur_if_data['rx_octets'],'byte')
+            if self.include_interfaces and self.interfacesoctets:
+                self._add_or_update_entity(
+                    prefix + f"netif_{if_name}_octets_out",
+                    f"{if_display} octets out",
+                    int(cur_if_data["tx_octets"]),
+                    "octets",
+                    "mdi:upload-network-outline",
+                )
+                self._add_or_update_entity(
+                    prefix + f"netif_{if_name}_octets_in",
+                    f"{if_display} octets in",
+                    int(cur_if_data["rx_octets"]),
+                    "octets",
+                    "mdi:download-network-outline",
+                )
 
         if self.include_cpu_and_ram:
             oids = (OID_CPUUSAGE, OID_RAMUSAGE)
-            errorIndication, oidReturn = snmp_getmulti(self.target_ip, self.username, self.port, oids)
-
-            if not errorIndication:
-                cpu_usage = int(oidReturn[0][1].prettyPrint())
-                ram_usage = int(oidReturn[1][1].prettyPrint())
-
-                self._AddOrUpdateEntity(allSensorsPrefix+"cpu_usage","CPU usage",cpu_usage,'%',"mdi:memory")
-                self._AddOrUpdateEntity(allSensorsPrefix+"ram_usage","RAM usage",ram_usage,'%',"mdi:memory")
+            error_indication, oid_return = await async_snmp_getmulti(
+                self.hass, self.target_ip, self.username, self.port, oids
+            )
+            if not error_indication:
+                cpu_usage = int(oid_return[0][1].prettyPrint())
+                ram_usage = int(oid_return[1][1].prettyPrint())
+                self._add_or_update_entity(
+                    prefix + "cpu_usage", "CPU usage", cpu_usage, "%", "mdi:memory"
+                )
+                self._add_or_update_entity(
+                    prefix + "ram_usage", "RAM usage", ram_usage, "%", "mdi:memory"
+                )
 
         if self.include_disk:
             oids = (OID_DISKUSAGE, OID_DISKCAPACITY)
-            errorIndication, oidReturn = snmp_getmulti(self.target_ip, self.username, self.port, oids)
-            
-            if not errorIndication:
-                disk_usage = int(oidReturn[0][1].prettyPrint())
-                disk_capacity = int(oidReturn[1][1].prettyPrint())
-
+            error_indication, oid_return = await async_snmp_getmulti(
+                self.hass, self.target_ip, self.username, self.port, oids
+            )
+            if not error_indication:
+                disk_usage = int(oid_return[0][1].prettyPrint())
+                disk_capacity = int(oid_return[1][1].prettyPrint())
                 disk_usagepct = int((disk_usage / disk_capacity) * 100)
-                disk_attrs = (
-                    {
-                        "Disk capacity (MB)":disk_capacity,
-                        "Disk usage (MB)":disk_usage
-                    }
+                disk_attrs = {
+                    "Disk capacity (MB)": disk_capacity,
+                    "Disk usage (MB)": disk_usage,
+                }
+                self._add_or_update_entity(
+                    prefix + "disk_usage",
+                    "Disk usage",
+                    disk_usagepct,
+                    "%",
+                    "mdi:database",
+                    disk_attrs,
                 )
-                self._AddOrUpdateEntity(allSensorsPrefix+"disk_usage","Disk usage",disk_usagepct,'%',"mdi:database", disk_attrs)
 
         if self.include_sessions:
-            errorIndication, snmp_data = snmp_getfromtable(self.target_ip, self.username, self.port, OID_SESSIONCOUNT)
-            
-            sessioncount = 0
-            if not errorIndication:
+            error_indication, snmp_data = await async_snmp_getfromtable(
+                self.hass,
+                self.target_ip,
+                self.username,
+                self.port,
+                OID_SESSIONCOUNT,
+            )
+            if not error_indication:
+                sessioncount = 0
                 for oid_entry in snmp_data:
-                    for oid, oid_value in oid_entry:
+                    for _oid, oid_value in oid_entry:
                         sessioncount += int(oid_value.prettyPrint())
-            
-                self._AddOrUpdateEntity(allSensorsPrefix+"sessions","Sessions",sessioncount,'sessions',"mdi:format-list-bulleted-type")
-            
-        if self.include_performanceslas:
-            oids = (OID_PERFORMANCESLALINKNAME, OID_PERFORMANCESLALINKSTATE, OID_PERFORMANCESLALINKLATENCY, OID_PERFORMANCESLALINKJITTER, OID_PERFORMANCESLALINKPACKETLOSS, OID_PERFORMANCESLALINKBANDWIDTHIN, OID_PERFORMANCESLALINKBANDWIDTHOUT) 
+                self._add_or_update_entity(
+                    prefix + "sessions",
+                    "Sessions",
+                    sessioncount,
+                    "sessions",
+                    "mdi:format-list-bulleted-type",
+                )
 
-            errorIndication, snmp_data = snmp_getmultifromtable(self.target_ip, self.username, self.port, oids)
-            if not errorIndication:
-                for sla_name, sla_state, sla_latency, sla_jitter, sla_packetloss, sla_bandwidthin, sla_bandwidthout in snmp_data:
-                    if sla_name[0].prettyPrint() in self.performance_slas:
-                        #The performance SLA itself is in scope.  See what we should be creating sensors for
-                        sla_index = sla_name[0].prettyPrint().split(".")[-1]
-                        sla_name = sla_name[1].prettyPrint()
-                        sla_state = sla_state[1].prettyPrint()
-                        
-                        if self.include_performanceslasstate:
-                            self._AddOrUpdateEntity(allSensorsPrefix+"sla_state_" + sla_index, sla_name + " state",PERFORMANCESLAS_STATE[sla_state],'',PERFORMANCESLAS_ICON[sla_state])
-                        
-                        if self.include_performanceslaslinkmetrics:
-                            self._AddOrUpdateEntity(allSensorsPrefix+"sla_latency_" + sla_index, sla_name + " latency",int(float(sla_latency[1].prettyPrint())),'ms',"mdi:timeline-clock-outline")
-                            self._AddOrUpdateEntity(allSensorsPrefix+"sla_jitter_" + sla_index, sla_name + " jitter",int(float(sla_jitter[1].prettyPrint())),'ms',"mdi:timeline-clock-outline")
-                            self._AddOrUpdateEntity(allSensorsPrefix+"sla_packetloss_" + sla_index, sla_name + " packet loss",int(float(sla_packetloss[1].prettyPrint())),'%',"mdi:timeline-alert-outline")
-              
-                        if self.include_performanceslasbandwidthprobe:
-                            self._AddOrUpdateEntity(allSensorsPrefix+"sla_bandwidthin_" + sla_index, sla_name + " probe bandwidth (in) ",int(sla_bandwidthin[1].prettyPrint())/1000,'Mbps',"mdi:download-network-outline")
-                            self._AddOrUpdateEntity(allSensorsPrefix+"sla_bandwidthout_" + sla_index, sla_name + " probe bandwidth (out) ",int(sla_bandwidthout[1].prettyPrint())/1000,'Mbps',"mdi:upload-network-outline")
-                        
+        if self.include_performanceslas and self.performance_slas:
+            oids = (
+                OID_PERFORMANCESLALINKNAME,
+                OID_PERFORMANCESLALINKSTATE,
+                OID_PERFORMANCESLALINKLATENCY,
+                OID_PERFORMANCESLALINKJITTER,
+                OID_PERFORMANCESLALINKPACKETLOSS,
+                OID_PERFORMANCESLALINKBANDWIDTHIN,
+                OID_PERFORMANCESLALINKBANDWIDTHOUT,
+            )
+            error_indication, snmp_data = await async_snmp_getmultifromtable(
+                self.hass, self.target_ip, self.username, self.port, oids
+            )
+            if not error_indication:
+                for (
+                    sla_name,
+                    sla_state,
+                    sla_latency,
+                    sla_jitter,
+                    sla_packetloss,
+                    sla_bandwidthin,
+                    sla_bandwidthout,
+                ) in snmp_data:
+                    if sla_name[0].prettyPrint() not in self.performance_slas:
+                        continue
+
+                    sla_index = sla_name[0].prettyPrint().split(".")[-1]
+                    sla_label = sla_name[1].prettyPrint()
+                    sla_state_val = sla_state[1].prettyPrint()
+
+                    if self.include_performanceslasstate:
+                        self._add_or_update_entity(
+                            prefix + f"sla_state_{sla_index}",
+                            f"{sla_label} state",
+                            PERFORMANCESLAS_STATE[sla_state_val],
+                            "",
+                            PERFORMANCESLAS_ICON[sla_state_val],
+                        )
+
+                    if self.include_performanceslaslinkmetrics:
+                        self._add_or_update_entity(
+                            prefix + f"sla_latency_{sla_index}",
+                            f"{sla_label} latency",
+                            int(float(sla_latency[1].prettyPrint())),
+                            "ms",
+                            "mdi:timeline-clock-outline",
+                        )
+                        self._add_or_update_entity(
+                            prefix + f"sla_jitter_{sla_index}",
+                            f"{sla_label} jitter",
+                            int(float(sla_jitter[1].prettyPrint())),
+                            "ms",
+                            "mdi:timeline-clock-outline",
+                        )
+                        self._add_or_update_entity(
+                            prefix + f"sla_packetloss_{sla_index}",
+                            f"{sla_label} packet loss",
+                            int(float(sla_packetloss[1].prettyPrint())),
+                            "%",
+                            "mdi:timeline-alert-outline",
+                        )
+
+                    if self.include_performanceslasbandwidthprobe:
+                        self._add_or_update_entity(
+                            prefix + f"sla_bandwidthin_{sla_index}",
+                            f"{sla_label} probe bandwidth (in)",
+                            int(sla_bandwidthin[1].prettyPrint()) / 1000,
+                            "Mbps",
+                            "mdi:download-network-outline",
+                        )
+                        self._add_or_update_entity(
+                            prefix + f"sla_bandwidthout_{sla_index}",
+                            f"{sla_label} probe bandwidth (out)",
+                            int(sla_bandwidthout[1].prettyPrint()) / 1000,
+                            "Mbps",
+                            "mdi:upload-network-outline",
+                        )
