@@ -4,7 +4,9 @@ import traceback
 
 # pylint: disable=unused-wildcard-import
 from .const import * 
-from .snmp import snmp_getfromtable, snmp_getmulti, snmp_getmultifromtable
+from pysnmp.error import PySnmpError
+
+from .snmp import configure_snmp_loop, snmp_getfromtable, snmp_getmulti, snmp_getmultifromtable
 
 # pylint: enable=unused-wildcard-import
 import threading
@@ -48,6 +50,7 @@ async def async_setup_platform(
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up sensor platform."""
+    configure_snmp_loop(hass.loop)
     maxretries=2
     for i in range(maxretries):
         try:

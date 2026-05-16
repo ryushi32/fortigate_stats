@@ -1,9 +1,14 @@
-from .snmp import snmp_getmulti, snmp_getfromtable, snmp_getmultifromtable
+from .snmp import (
+    async_snmp_getfromtable,
+    async_snmp_getmulti,
+    async_snmp_getmultifromtable,
+)
 import traceback
 import logging
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
+from homeassistant.helpers import config_validation as cv
 # pylint: disable=unused-wildcard-import
 from .const import * # 
 # pylint: enable=unused-wildcard-import
@@ -20,7 +25,22 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
     def __init__(self):
         """Initialize."""
         #self.data_schema = CONFIG_SCHEMA_MAIN
-        
+
+    def _user_schema(self):
+        return vol.Schema(
+            {
+                vol.Required(CONF_USERNAME): str,
+                vol.Required(CONF_IP_ADDRESS): str,
+                vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
+                vol.Required(CONF_CPUANDRAM, default=True): bool,
+                vol.Required(CONF_DISK, default=True): bool,
+                vol.Required(CONF_SESSIONS, default=True): bool,
+                vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
+                vol.Optional(CONF_INTERFACESYESNO, default=True): bool,
+                vol.Optional(CONF_PERFORMANCESLASYESNO, default=False): bool,
+            }
+        )
+
     async def async_step_user(self, user_input=None):
         """Handle a flow initialized by the user."""
         #if self._async_current_entries():
@@ -28,20 +48,8 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
 
         if not user_input:
             return self._show_form(
-                step_id = "user",
-                data_schema = vol.Schema(
-                    {
-                        vol.Required(CONF_USERNAME): str,
-                        vol.Required(CONF_IP_ADDRESS): str,
-                        vol.Optional(CONF_PORT, default = DEFAULT_PORT): int,
-                        vol.Required(CONF_CPUANDRAM, default = True): bool,
-                        vol.Required(CONF_DISK, default = True): bool,
-                        vol.Required(CONF_SESSIONS, default = True): bool,
-                        vol.Optional(CONF_SCAN_INTERVAL, default = DEFAULT_SCAN_INTERVAL): int,
-                        vol.Optional(CONF_INTERFACESYESNO, default = True): bool,
-                        vol.Optional(CONF_PERFORMANCESLASYESNO, default = False): bool
-                    }
-                ),
+                step_id="user",
+                data_schema=self._user_schema(),
             )
 
         username = user_input[CONF_USERNAME]
@@ -51,20 +59,30 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
         try:
             #We only need to get this information once, so get it as part of the connection test and add it to user_input
             oids = (OID_HOSTNAME, OID_SERIALNUMBER, OID_MODEL,OID_FORTIOS)
-            errorIndication, oidReturn = snmp_getmulti(ipaddress, username, port, oids)
+            errorIndication, oidReturn = await async_snmp_getmulti(
+                ipaddress, username, port, oids
+            )
             
-            if not errorIndication:
-                user_input[OID_HOSTNAME] = oidReturn[0][1].prettyPrint()
-                user_input[OID_SERIALNUMBER] = oidReturn[1][1].prettyPrint()
-                user_input[OID_MODEL] = oidReturn[2][1].prettyPrint()
-                user_input[OID_FORTIOS] = oidReturn[3][1].prettyPrint()
-            
-        except:
-            e = traceback.format_exec()
-            LOGGER.error("Unable to connect to snmp: %s", e)
-            #if ex.errcode == 400:
-            #    return self._show_form({"base": "invalid_credentials"})
-            return self._show_form({"base": "connection_error"})
+            if errorIndication:
+                LOGGER.error("Unable to connect to snmp: %s", errorIndication)
+                return self._show_form(
+                    step_id="user",
+                    data_schema=self._user_schema(),
+                    errors={"base": "connection_error"},
+                )
+
+            user_input[OID_HOSTNAME] = oidReturn[0][1].prettyPrint()
+            user_input[OID_SERIALNUMBER] = oidReturn[1][1].prettyPrint()
+            user_input[OID_MODEL] = oidReturn[2][1].prettyPrint()
+            user_input[OID_FORTIOS] = oidReturn[3][1].prettyPrint()
+
+        except Exception:
+            LOGGER.error("Unable to connect to snmp: %s", traceback.format_exc())
+            return self._show_form(
+                step_id="user",
+                data_schema=self._user_schema(),
+                errors={"base": "connection_error"},
+            )
         
         #Save the current data set
         self.user_input = user_input
@@ -93,11 +111,13 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
             
             oids = (OID_IFSTATUS, OID_IFNAME, OID_IFALIAS)
 
-            errorIndication, snmp_data = snmp_getmultifromtable(ipaddress, username, port, oids)
+            CONNECTED_INTERFACES = {}
+            errorIndication, snmp_data = await async_snmp_getmultifromtable(
+                ipaddress, username, port, oids
+            )
             if not errorIndication:
-                CONNECTED_INTERFACES = {}
                 for status, name, alias in snmp_data:
-                    if ( status[1] == 1):
+                    if int(status[1]) == 1:
                         #Include it in the list
                         #Get the right name
                         if ( alias[1].prettyPrint() != ""):
@@ -129,8 +149,11 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
         if self.user_input[CONF_PERFORMANCESLASYESNO]:
             return await self.async_step_performanceslas()
 
-        return
-    
+        return self.async_create_entry(
+            title=self.user_input[OID_HOSTNAME],
+            data=self.user_input,
+        )
+
     async def async_step_performanceslas(self,user_input3 = None):
         """Second page of the flow."""
 
@@ -142,9 +165,11 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
             ipaddress = self.user_input[CONF_IP_ADDRESS]
             port = self.user_input[CONF_PORT]
 
-            errorIndication, snmp_data = snmp_getfromtable(ipaddress, username, port, OID_PERFORMANCESLALINKNAME)
+            PERFORMANCESLA_LINKS = {}
+            errorIndication, snmp_data = await async_snmp_getfromtable(
+                ipaddress, username, port, OID_PERFORMANCESLALINKNAME
+            )
             if not errorIndication:
-                PERFORMANCESLA_LINKS = {}
                 for oid_entry in snmp_data:
                     for oid, oid_value in oid_entry:
                         PERFORMANCESLA_LINKS[oid.prettyPrint()] = oid_value.prettyPrint()
@@ -167,11 +192,13 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
 
         performanceslas = user_input3[CONF_PERFORMANCESLAS]
                         
-        #Is there a better way of doing this?
         self.user_input = self.user_input | user_input3
-        
-        return
-        
+
+        return self.async_create_entry(
+            title=self.user_input[OID_HOSTNAME],
+            data=self.user_input,
+        )
+
     @callback
     def _show_form(self, step_id,data_schema,errors = None):
         """Show the form to the user."""
