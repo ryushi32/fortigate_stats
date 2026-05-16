@@ -1,11 +1,11 @@
 {
     "domain": "fortigate_stats",
     "name": "FortiGate Stats",
-    "documentation": "https://github.com/andystewart999/fortigate_stats",
-    "issue_tracker": "https://github.com/andystewart999/fortigate_stats/issues",
+    "documentation": "https://github.com/ryushi32/fortigate_stats",
+    "issue_tracker": "https://github.com/ryushi32/fortigate_stats/issues",
     "dependencies": [],
-    "codeowners": ["@andystewart999"],
-    "requirements": ["pysnmp"],
+    "codeowners": ["@ryushi32", "@andystewart999"],
+    "requirements": ["pysnmp==7.1.21"],
     "config_flow": true,
     "version": "1.0.0"
 }
