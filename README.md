@@ -5,8 +5,4 @@ Home Assistant integration to show statistics from a FortiGate firewall, via SNM
 - Per-interface bandwidth usage sensors for connected interfaces 
 - Performance SLA/Link Health status (if enabled on the firewall)
 
-Tested and working with FortiOS 6.2.11 on a Fortigate 100D.
-
-With thanks to [weltmeyer](https://github.com/weltmeyer) and [wxt9861](https://github.com/wxt9861) for doing most of the heavy lifting!
-
-This is my first full Python hobbyist/testbed project and it's a work-in-progress... I'm sure there are many optimisations and improvements that could be made, feel free to comment.
+Tested and working with FortiOS 7.4.11 on a Fortigate 91G
