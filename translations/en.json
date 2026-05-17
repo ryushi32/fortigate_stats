@@ -27,7 +27,8 @@
                 "data": {
                     "interfaces": "Select interfaces",
 					"interfacesbandwidth": "Include bandwidth metrics",
-					"interfacesoctets": "Include bandwidth octets"
+					"interfacesoctets": "Include bandwidth octets",
+					"interfacesmonthly": "Include monthly bandwidth usage (up/down)"
                 },
                 "title": "FortiGate Stats",
 				"description": "Select which network interfaces to monitor, and which types of data you'd like sensors created for.  Note that only currently connected interfaces are shown."

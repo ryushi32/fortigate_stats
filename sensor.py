@@ -6,6 +6,7 @@ import logging
 import time
 from datetime import timedelta
 
+from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import Entity
@@ -19,6 +20,7 @@ from .snmp import (
     async_snmp_getmulti,
     async_snmp_getmultifromtable,
 )
+from .storage import MonthlyBandwidthStorage
 
 # pylint: enable=unused-wildcard-import
 
@@ -30,6 +32,15 @@ from homeassistant.const import (  # noqa: E402
 )
 
 _LOGGER = logging.getLogger(__name__)
+_BYTES_TO_GIB = 1 / (1024**3)
+
+
+def _counter_delta(current: int, previous: int) -> int:
+    """Bytes since last sample; handles SNMP counter reset."""
+    if previous < 0:
+        return 0
+    diff = current - previous
+    return diff if diff >= 0 else current
 
 
 async def async_setup_entry(
@@ -41,6 +52,7 @@ async def async_setup_entry(
     monitor = SnmpStatisticsMonitor(hass, config_entry, async_add_entities)
     hass.data.setdefault(DOMAIN, {})[config_entry.entry_id] = {"monitor": monitor}
 
+    await monitor.async_load_storage()
     await monitor.async_update()
 
     interval = timedelta(
@@ -59,7 +71,16 @@ async def async_setup_entry(
 class SnmpStatisticsSensor(Entity):
     """FortiGate SNMP sensor."""
 
-    def __init__(self, entity_id, fw_info, name=None, unit=None, icon=None):
+    def __init__(
+        self,
+        entity_id,
+        fw_info,
+        name=None,
+        unit=None,
+        icon=None,
+        state_class=None,
+        device_class=None,
+    ):
         self._attributes = {}
         self._state = "unknown"
         self.fw_info = fw_info
@@ -67,6 +88,8 @@ class SnmpStatisticsSensor(Entity):
         self._name = name if name is not None else entity_id
         self._unitofmeasurement = unit
         self._icon = icon if icon is not None else "mdi:eye"
+        self._state_class = state_class
+        self._device_class = device_class
         _LOGGER.info("Created sensor %s", entity_id)
 
     def set_state(self, state):
@@ -100,6 +123,14 @@ class SnmpStatisticsSensor(Entity):
     @property
     def unit_of_measurement(self):
         return self._unitofmeasurement
+
+    @property
+    def state_class(self):
+        return self._state_class
+
+    @property
+    def device_class(self):
+        return self._device_class
 
     @property
     def state(self):
@@ -143,6 +174,8 @@ class SnmpStatisticsMonitor:
 
         self.include_interfaces = config_entry.data.get(CONF_INTERFACESYESNO)
         self.interfaces = set()
+        self.interfacesmonthly = False
+        self._monthly_storage = None
         if self.include_interfaces:
             selected = config_entry.data.get(CONF_INTERFACES) or []
             if isinstance(selected, dict):
@@ -150,6 +183,11 @@ class SnmpStatisticsMonitor:
             self.interfaces = set(selected)
             self.interfacesbandwidth = config_entry.data.get(CONF_INTERFACESBANDWIDTH)
             self.interfacesoctets = config_entry.data.get(CONF_INTERFACESOCTETS)
+            self.interfacesmonthly = config_entry.data.get(CONF_INTERFACESMONTHLY, True)
+            if self.interfacesmonthly:
+                self._monthly_storage = MonthlyBandwidthStorage(
+                    hass, config_entry.entry_id
+                )
 
         self.include_performanceslas = config_entry.data.get(CONF_PERFORMANCESLASYESNO)
         self.performance_slas = set()
@@ -175,12 +213,19 @@ class SnmpStatisticsMonitor:
             OID_FORTIOS: config_entry.data.get(OID_FORTIOS),
         }
 
+    async def async_load_storage(self) -> None:
+        """Load persisted monthly bandwidth totals."""
+        if self._monthly_storage is not None:
+            await self._monthly_storage.async_load()
+
     async def async_update(self) -> None:
         """Refresh SNMP data and update sensor entities."""
         try:
             if self.include_interfaces and self.interfaces:
                 await self._async_update_netif_stats()
             await self._async_add_or_update_entities()
+            if self._monthly_storage is not None:
+                await self._monthly_storage.async_save()
         except Exception:
             _LOGGER.exception("Error updating FortiGate Stats sensors")
 
@@ -223,6 +268,18 @@ class SnmpStatisticsMonitor:
             if_data[if_id]["rx_octets"] = int(if_hcinoctets[1].prettyPrint())
             if_data[if_id]["tx_octets"] = int(if_hcoutoctets[1].prettyPrint())
 
+        if self._monthly_storage is not None:
+            for if_id, cur_data in if_data.items():
+                if if_id not in self.interfaces:
+                    continue
+                rx_delta = _counter_delta(
+                    cur_data["rx_octets"], cur_data["rx_octets_prev"]
+                )
+                tx_delta = _counter_delta(
+                    cur_data["tx_octets"], cur_data["tx_octets_prev"]
+                )
+                self._monthly_storage.add_delta(if_id, rx_delta, tx_delta)
+
         new_if_data_time = time.time()
         for if_id in list(self.current_if_data):
             cur_data = self.current_if_data[if_id]
@@ -248,14 +305,28 @@ class SnmpStatisticsMonitor:
         self.current_if_data_time = new_if_data_time
 
     def _add_or_update_entity(
-        self, entity_id, friendlyname, value, unit, icon, attributes=None
+        self,
+        entity_id,
+        friendlyname,
+        value,
+        unit,
+        icon,
+        attributes=None,
+        state_class=None,
+        device_class=None,
     ):
         if entity_id in self.meter_sensors:
             sensor = self.meter_sensors[entity_id]
             sensor.set_state(value)
         else:
             sensor = SnmpStatisticsSensor(
-                entity_id, self.fw_info, friendlyname, unit, icon
+                entity_id,
+                self.fw_info,
+                friendlyname,
+                unit,
+                icon,
+                state_class=state_class,
+                device_class=device_class,
             )
             sensor._state = value
             self.async_add_entities([sensor])
@@ -307,6 +378,27 @@ class SnmpStatisticsMonitor:
                     int(cur_if_data["rx_octets"]),
                     "octets",
                     "mdi:download-network-outline",
+                )
+
+            if self.include_interfaces and self.interfacesmonthly:
+                month_rx, month_tx = self._monthly_storage.get_totals(if_id)
+                self._add_or_update_entity(
+                    prefix + f"netif_{if_name}_monthly_in_gib",
+                    f"{if_display} monthly download",
+                    round(month_rx * _BYTES_TO_GIB, 3),
+                    "GiB",
+                    "mdi:download-network",
+                    state_class=SensorStateClass.TOTAL,
+                    device_class=SensorDeviceClass.DATA_SIZE,
+                )
+                self._add_or_update_entity(
+                    prefix + f"netif_{if_name}_monthly_out_gib",
+                    f"{if_display} monthly upload",
+                    round(month_tx * _BYTES_TO_GIB, 3),
+                    "GiB",
+                    "mdi:upload-network",
+                    state_class=SensorStateClass.TOTAL,
+                    device_class=SensorDeviceClass.DATA_SIZE,
                 )
 
         if self.include_cpu_and_ram:

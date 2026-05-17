@@ -146,6 +146,8 @@ class ConfigFlowHandler(config_entries.ConfigFlow,domain=DOMAIN):
                             CONF_INTERFACESBANDWIDTH, default = True): bool,
                         vol.Optional(
                             CONF_INTERFACESOCTETS, default = False): bool,
+                        vol.Optional(
+                            CONF_INTERFACESMONTHLY, default = True): bool,
                     }
                 ),
             )
